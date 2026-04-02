@@ -30,6 +30,8 @@ PRICE_FEEDS: Dict[str, str] = {
     "USDT/USD": "0x2b89b9dc8fdf9f34709a5b106b472f0f39bb6ca9ce04b0fd7f2e971688e2e53b",
     # Hermes: Crypto.USDC/USD (old 0x41f36… returns 404 on /v2/updates/price/latest)
     "USDC/USD": "0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
+    # Hermes: Crypto.USD1/USD (World Liberty Financial USD1)
+    "USD1/USD": "0x0a2425d43486780990d8b63543029e20556be51fd756cca584212f4d539611d4",
 }
 
 # Pyth symbol -> DB key (sol-price matches solana-swap-listener CLICKHOUSE_SOL_PRICE_KEY default)
@@ -39,6 +41,7 @@ SYMBOL_TO_KEY: Dict[str, str] = {
     "ETH/USD": "eth-price",
     "USDT/USD": "usdt-price",
     "USDC/USD": "usdc-price",
+    "USD1/USD": "usd1-price",
 }
 
 
