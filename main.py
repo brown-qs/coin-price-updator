@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Poll Pyth Hermes for multiple USD feeds; insert key–value rows into ClickHouse bbb.system."""
+"""Poll Pyth Hermes for multiple USD feeds; upsert key–value rows into PostgreSQL bbb.system."""
 
 from __future__ import annotations
 
@@ -11,16 +11,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
-import clickhouse_connect
+import psycopg2
 from dotenv import load_dotenv
 
 log = logging.getLogger("coin-price-updator")
 
-
-def _ch_db_ident(s: str) -> bool:
-    return bool(s) and len(s) < 256 and all(c.isalnum() or c == "_" for c in s)
 
 # Pyth price feed IDs (Solana mainnet / global feed ids) -> human symbol
 PRICE_FEEDS: Dict[str, str] = {
@@ -34,7 +31,7 @@ PRICE_FEEDS: Dict[str, str] = {
     "USD1/USD": "0x0a2425d43486780990d8b63543029e20556be51fd756cca584212f4d539611d4",
 }
 
-# Pyth symbol -> DB key (sol-price matches solana-swap-listener CLICKHOUSE_SOL_PRICE_KEY default)
+# Pyth symbol -> DB key (sol-price matches solana-swap-listener default)
 SYMBOL_TO_KEY: Dict[str, str] = {
     "SOL/USD": "sol-price",
     "BTC/USD": "btc-price",
@@ -105,15 +102,37 @@ def parse_prices(data: dict, id_to_symbol: Dict[str, str]) -> Dict[str, float]:
     return out
 
 
-def kv_rows_from_prices(prices: Dict[str, float]) -> List[List]:
+def kv_rows_from_prices(prices: Dict[str, float]) -> List[Tuple[str, str, datetime]]:
     now = datetime.now(timezone.utc)
-    rows: List[List] = []
+    rows: List[Tuple[str, str, datetime]] = []
     for sym, db_key in SYMBOL_TO_KEY.items():
         if sym not in prices:
             continue
         v = prices[sym]
-        rows.append([now, db_key, f"{v:.12g}"])
+        rows.append((db_key, f"{v:.12g}", now))
     return rows
+
+
+def pg_connect():
+    return psycopg2.connect(
+        host=os.environ.get("POSTGRES_HOST", "127.0.0.1").strip(),
+        port=int(os.environ.get("POSTGRES_PORT", "5432")),
+        user=os.environ.get("POSTGRES_USER", "bbbadmin").strip(),
+        password=os.environ.get("POSTGRES_PASSWORD", ""),
+        dbname=os.environ.get("POSTGRES_DB", "bbb").strip(),
+    )
+
+
+def upsert_rows(conn, table_fqn: str, rows: List[Tuple[str, str, datetime]]) -> None:
+    if not rows:
+        return
+    sql = (
+        f"INSERT INTO {table_fqn} (key, value, updated_at) VALUES (%s, %s, %s) "
+        f"ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at"
+    )
+    with conn.cursor() as cur:
+        cur.executemany(sql, rows)
+    conn.commit()
 
 
 def main() -> None:
@@ -125,13 +144,9 @@ def main() -> None:
     )
 
     hermes_base = os.environ.get("PYTH_HERMES_BASE", "https://hermes.pyth.network").strip()
-    host = os.environ.get("CLICKHOUSE_HOST", "127.0.0.1").strip()
-    port = int(os.environ.get("CLICKHOUSE_PORT", "8123"))
-    user = os.environ.get("CLICKHOUSE_USER", "default").strip()
-    password = os.environ.get("CLICKHOUSE_PASSWORD", "") or None
-    database = os.environ.get("CLICKHOUSE_DATABASE", "bbb").strip()
-    system_table = os.environ.get("CLICKHOUSE_SYSTEM_TABLE", "system").strip() or "system"
-    interface = os.environ.get("CLICKHOUSE_INTERFACE", "http").strip().lower()
+    schema = os.environ.get("POSTGRES_SCHEMA", "bbb").strip() or "bbb"
+    table = os.environ.get("POSTGRES_SYSTEM_TABLE", "system").strip() or "system"
+    table_fqn = f'"{schema}"."{table}"'
     poll = int(os.environ.get("POLL_INTERVAL_SEC", "60"))
     if poll < 10:
         poll = 10
@@ -140,26 +155,14 @@ def main() -> None:
     feed_ids = list(PRICE_FEEDS.values())
     url = hermes_latest_url(hermes_base, feed_ids)
 
-    ch_kw: dict = {
-        "host": host,
-        "port": port,
-        "username": user,
-        "password": password,
-        "database": database,
-    }
-    if interface == "native":
-        ch_kw["interface"] = "native"
-    client = clickhouse_connect.get_client(**ch_kw)
+    conn = pg_connect()
 
     log.info(
-        "Hermes %s — %d feeds; CH %s:%s table=%s.%s (%s)",
+        "Hermes %s — %d feeds; PG %s table=%s",
         hermes_base,
         len(feed_ids),
-        host,
-        port,
-        database,
-        system_table,
-        interface,
+        os.environ.get("POSTGRES_HOST", "127.0.0.1"),
+        table_fqn,
     )
 
     sol_key = SYMBOL_TO_KEY["SOL/USD"]
@@ -177,21 +180,16 @@ def main() -> None:
                 rows = kv_rows_from_prices(prices)
                 if not rows:
                     continue
-                client.insert(
-                    system_table,
-                    rows,
-                    database=database,
-                    column_names=["updated_at", "key", "value"],
-                )
-                # Collapse duplicate keys to one physical row per key (tiny table; cheap).
-                if os.environ.get("CLICKHOUSE_OPTIMIZE_FINAL", "1").strip().lower() in (
-                    "1",
-                    "true",
-                    "yes",
-                ) and _ch_db_ident(database) and _ch_db_ident(system_table):
-                    client.command(
-                        f"OPTIMIZE TABLE `{database}`.`{system_table}` FINAL"
-                    )
+                try:
+                    upsert_rows(conn, table_fqn, rows)
+                except (psycopg2.InterfaceError, psycopg2.OperationalError) as db_err:
+                    log.warning("PG connection lost (%s); reconnecting", db_err)
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = pg_connect()
+                    upsert_rows(conn, table_fqn, rows)
                 log.info(
                     "updated %d keys e.g. %s=%.4f",
                     len(rows),
