@@ -41,6 +41,16 @@ SYMBOL_TO_KEY: Dict[str, str] = {
     "USD1/USD": "usd1-price",
 }
 
+# Non-Pyth tokens priced via DexScreener. Used for platform/launchpad quote
+# tokens that pair with subject tokens on EVM DEXs (evm-swap-listener consults
+# these keys to USD-value swaps paired with these tokens). One entry per
+# (db_key, chain, token_address). DexScreener is queried for the token's most
+# liquid USD-quoted pair; priceUsd is taken from there.
+DEX_TOKENS: List[Tuple[str, str, str]] = [
+    # (db_key, chain, token_address)
+    ("zora-price", "base", "0x1111111111166b7fe7bd91427724b487980afc69"),
+]
+
 
 def norm_feed_id(pid: str) -> str:
     s = (pid or "").strip().lower()
@@ -100,6 +110,62 @@ def parse_prices(data: dict, id_to_symbol: Dict[str, str]) -> Dict[str, float]:
             continue
         out[sym] = pyth_human_price(p)
     return out
+
+
+def fetch_dexscreener_price(chain: str, token_addr: str, timeout: float = 15.0) -> float:
+    """Return the most-liquid USD-quoted priceUsd for `token_addr` on `chain`,
+    or 0.0 on failure. We prefer the pair with the highest liquidity.usd to
+    avoid wash-traded dust pools."""
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}"
+    # DexScreener's WAF rejects urllib's default UA with 403 — same pattern
+    # as the Hermes endpoint.
+    ua = os.environ.get(
+        "DEXSCREENER_USER_AGENT",
+        "coin-price-updator/1.0 (+https://github.com/anthropics)",
+    ).strip() or "coin-price-updator/1.0"
+    req = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": ua},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:
+        log.warning("dexscreener %s/%s: %s", chain, token_addr, e)
+        return 0.0
+    pairs = data.get("pairs") or []
+    chain_lc = chain.strip().lower()
+    best_liq = 0.0
+    best_price = 0.0
+    for p in pairs:
+        if (p.get("chainId") or "").strip().lower() != chain_lc:
+            continue
+        try:
+            price = float(p.get("priceUsd") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0:
+            continue
+        try:
+            liq = float((p.get("liquidity") or {}).get("usd") or 0)
+        except (TypeError, ValueError):
+            liq = 0.0
+        if liq > best_liq:
+            best_liq = liq
+            best_price = price
+    return best_price
+
+
+def kv_rows_from_dex_tokens(now: datetime) -> List[Tuple[str, str, datetime]]:
+    rows: List[Tuple[str, str, datetime]] = []
+    for db_key, chain, addr in DEX_TOKENS:
+        price = fetch_dexscreener_price(chain, addr)
+        if price <= 0:
+            log.warning("dexscreener returned no price for %s (%s/%s)", db_key, chain, addr)
+            continue
+        rows.append((db_key, f"{price:.12g}", now))
+    return rows
 
 
 def kv_rows_from_prices(prices: Dict[str, float]) -> List[Tuple[str, str, datetime]]:
@@ -178,6 +244,9 @@ def main() -> None:
                 log.error("SOL/USD missing or invalid; skip insert (swap listener needs %r)", sol_key)
             else:
                 rows = kv_rows_from_prices(prices)
+                # Append DexScreener-sourced non-Pyth quote tokens (ZORA, …).
+                dex_rows = kv_rows_from_dex_tokens(datetime.now(timezone.utc))
+                rows.extend(dex_rows)
                 if not rows:
                     continue
                 try:
@@ -191,8 +260,9 @@ def main() -> None:
                     conn = pg_connect()
                     upsert_rows(conn, table_fqn, rows)
                 log.info(
-                    "updated %d keys e.g. %s=%.4f",
+                    "updated %d keys (pyth + %d dex) e.g. %s=%.4f",
                     len(rows),
+                    len(dex_rows),
                     sol_key,
                     prices.get("SOL/USD", 0),
                 )
