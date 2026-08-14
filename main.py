@@ -29,6 +29,9 @@ PRICE_FEEDS: Dict[str, str] = {
     "USDC/USD": "0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
     # Hermes: Crypto.USD1/USD (World Liberty Financial USD1)
     "USD1/USD": "0x0a2425d43486780990d8b63543029e20556be51fd756cca584212f4d539611d4",
+    # Hermes: Crypto.BNB/USD — needed so evm-swap-listener can value WBNB-quoted
+    # BSC swaps (without it, ALL WBNB-paired BSC volume is dropped, e.g. $MarsCoin).
+    "BNB/USD": "0x2f95862b045670cd22bee3114c39763a4a08beeb663b145d283c31d7d1101c4f",
 }
 
 # Pyth symbol -> DB key (sol-price matches solana-swap-listener default)
@@ -39,6 +42,7 @@ SYMBOL_TO_KEY: Dict[str, str] = {
     "USDT/USD": "usdt-price",
     "USDC/USD": "usdc-price",
     "USD1/USD": "usd1-price",
+    "BNB/USD": "bnb-price",
 }
 
 # Non-Pyth tokens priced via DexScreener. Used for platform/launchpad quote
@@ -49,6 +53,8 @@ SYMBOL_TO_KEY: Dict[str, str] = {
 DEX_TOKENS: List[Tuple[str, str, str]] = [
     # (db_key, chain, token_address)
     ("zora-price", "base", "0x1111111111166b7fe7bd91427724b487980afc69"),
+    # VIRTUAL — quote token for "…by Virtuals" agent pairs on Robinhood chain.
+    ("virtual-price", "robinhood", "0xc6911796042b15d7Fa4F6CDe69e245DdCd3d9c31"),
 ]
 
 
